@@ -1,13 +1,8 @@
-import { google } from 'googleapis';
 import { HfInference } from '@huggingface/inference';
-import mysql, { ResultSetHeader } from 'mysql2/promise';
+import { google } from 'googleapis';
+import weaviate, { WeaviateClient } from 'weaviate-ts-client';
 
-const HF_READ_TOKEN = process.env.HF_READ_TOKEN2 || '';
 const HF_WRITE_TOKEN = process.env.HF_WRITE_TOKEN2 || '';
-const HOST = process.env.SINGLE_STORE_HOST;
-const USER = 'admin';
-const PASSWORD = process.env.SINGLE_STORE_PASSWORD;
-const DATABASE = 'vectordatabase2';
 const MODEL = process.env.EMBEDDING_MODEL || '';
 
 const hf = new HfInference(HF_WRITE_TOKEN);
@@ -16,7 +11,35 @@ const youtube = google.youtube({
   auth: process.env.YOUTUBE_API_KEY,
 });
 
+const client: WeaviateClient = weaviate.client({
+  scheme: 'http',
+  host: 'localhost:8080',
+});
+
 export async function GET(request: Request) {
+  const { searchParams } = new URL(request.url);
+  const keyword = searchParams.get('keyword');
+  let result: any = null;
+
+  if (!keyword) {
+    return new Response(JSON.stringify(result));
+  }
+
+  const res = await client.graphql
+    .get()
+    .withClassName('Comment')
+    .withFields('content')
+    .withNearText({
+      concepts: [keyword],
+      distance: 0.9,
+    })
+    .withLimit(5)
+    .do();
+
+  return new Response(JSON.stringify(res.data.Get.Comment));
+}
+
+export async function POST(request: Request) {
   const { searchParams } = new URL(request.url);
   const id = searchParams.get('id');
   const comments: string[] = [];
@@ -30,62 +53,36 @@ export async function GET(request: Request) {
 
   if (!res || !res.data) return new Response(JSON.stringify(comments));
 
-  const db = await getSingleStoreConnection();
-  const conn = await db.getConnection();
-
   if (res.data.items) {
-    res.data.items.forEach(async (item) => {
+    const promises = res.data.items.map(async (item) => {
       const content = item.snippet?.topLevelComment?.snippet?.textOriginal;
       if (!content) return;
 
-      const vector = await hf.featureExtraction({
-        model: MODEL,
-        inputs: content,
-      });
+      comments.push(content);
 
-      if (!vector) return;
+      // const vector = await hf.featureExtraction({
+      //   model: MODEL,
+      //   inputs: content,
+      // });
 
-      await createSSComment({ conn, content, vector });
+      // if (!vector) return;
+      // console.log(
+      //   '🚀 ~ file: route.ts:83 ~ res.data.items.forEach ~ vector:',
+      //   vector
+      // );
+
+      await client.data
+        .creator()
+        .withClassName('Comment')
+        .withProperties({
+          content,
+          vector: Buffer.from(JSON.stringify(content)).toString('base64'),
+        })
+        .do();
     });
+
+    await Promise.all(promises);
   }
 
   return new Response(JSON.stringify(comments));
 }
-
-const getSingleStoreConnection = async () => {
-  let singleStoreConnection;
-  try {
-    singleStoreConnection = mysql.createPool({
-      host: HOST,
-      user: USER,
-      password: PASSWORD,
-      database: DATABASE,
-      waitForConnections: true,
-      connectionLimit: 100,
-      queueLimit: 0,
-    });
-
-    console.log('You have successfully connected to SingleStore.');
-  } catch (err) {
-    console.error('ERROR', err);
-    process.exit(1);
-  }
-
-  return singleStoreConnection;
-};
-
-const createSSComment = async ({
-  conn,
-  content,
-  vector,
-}: {
-  conn: mysql.Connection;
-  content: string;
-  vector: any;
-}) => {
-  const [results] = await conn.execute<ResultSetHeader>(
-    'INSERT INTO comments VALUES (?, JSON_ARRAY_PACK(?))',
-    [JSON.stringify(content), JSON.stringify(vector)]
-  );
-  return results.insertId;
-};
